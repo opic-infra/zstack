@@ -1,13 +1,15 @@
 package org.zstack.kvm.hypervisor;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.transaction.annotation.Transactional;
 import org.zstack.core.Platform;
 import org.zstack.core.cloudbus.CloudBus;
 import org.zstack.core.cloudbus.EventCallback;
 import org.zstack.core.cloudbus.EventFacade;
 import org.zstack.core.db.DatabaseFacade;
+import org.zstack.core.db.GLock;
 import org.zstack.core.db.Q;
+import org.zstack.core.db.SQLBatch;
+import org.zstack.core.db.SQLBatchWithReturn;
 import org.zstack.core.db.SQL;
 import org.zstack.header.Component;
 import org.zstack.header.host.GetVirtualizerInfoMsg;
@@ -23,8 +25,10 @@ import org.zstack.utils.CollectionUtils;
 import org.zstack.utils.Utils;
 import org.zstack.utils.logging.CLogger;
 
+import java.sql.SQLIntegrityConstraintViolationException;
 import javax.persistence.Tuple;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -38,6 +42,8 @@ import static org.zstack.kvm.hypervisor.HypervisorMetadataCollector.HypervisorMe
  */
 public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, Component {
     private static final CLogger logger = Utils.getLogger(KvmHypervisorInfoManagerImpl.class);
+    private static final String SAVE_LOCK = "save-kvm-hypervisor-info";
+    private static final long SAVE_LOCK_TIMEOUT = TimeUnit.MINUTES.toSeconds(30);
 
     @Autowired
     private DatabaseFacade db;
@@ -73,8 +79,28 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
         logger.debug(String.format("save VirtualizerInfoTO for vm[uuid:%s] successfully", info.getUuid()));
     }
 
-    @Transactional
     private void save(List<ResourceHypervisorInfo> list) {
+        GLock lock = new GLock(SAVE_LOCK, SAVE_LOCK_TIMEOUT);
+        lock.lock();
+        try {
+            new SQLBatch() {
+                @Override
+                protected void scripts() {
+                    saveUnderLock(list);
+                }
+            }.execute();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /*
+     * The same hypervisor info is reported concurrently by host reconnecting, VM start response and
+     * the libvirt start event. save() is select-then-insert, so the later writer can hit the primary
+     * key. The global lock serializes writers across management nodes; this fallback only handles a
+     * residual duplicate-key race and keeps the repeated report idempotent.
+     */
+    private void saveUnderLock(List<ResourceHypervisorInfo> list) {
         Map<String, ResourceHypervisorInfo> uuidInfoMap = list.stream()
                 .collect(Collectors.toMap(info -> info.uuid, Function.identity()));
 
@@ -83,7 +109,6 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
         collectHostMatchTargetInfo(uuidInfoMap);
         collectHypervisorInfoVo(uuidInfoMap);
 
-        // Save
         List<ResourceHypervisorInfo> toUpdateList = new ArrayList<>();
         List<ResourceHypervisorInfo> toPersistList = new ArrayList<>();
 
@@ -99,10 +124,46 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
         }
 
         if (!toPersistList.isEmpty()) {
-            db.persistCollection(toPersistList.stream()
+            saveNewHypervisorInfoList(toPersistList.stream()
                     .map(ResourceHypervisorInfo::generate)
                     .collect(Collectors.toList()));
         }
+    }
+
+    private void saveNewHypervisorInfoList(List<KvmHypervisorInfoVO> infoList) {
+        try {
+            db.persistCollection(infoList);
+        } catch (RuntimeException e) {
+            if (!isDuplicatePrimaryKey(e)) {
+                throw e;
+            }
+
+            logger.debug(String.format("hypervisor info[uuid:%s] has been written concurrently, fallback to update",
+                    infoList.stream().map(KvmHypervisorInfoVO::getUuid).collect(Collectors.joining(","))));
+            for (KvmHypervisorInfoVO info : infoList) {
+                if (db.findByUuid(info.getUuid(), KvmHypervisorInfoVO.class) == null) {
+                    db.persist(info);
+                } else {
+                    db.update(info);
+                }
+            }
+        }
+    }
+
+    private boolean isDuplicatePrimaryKey(Throwable throwable) {
+        for (Throwable cause = throwable; cause != null; cause = cause.getCause()) {
+            if (!(cause instanceof SQLIntegrityConstraintViolationException)) {
+                continue;
+            }
+
+            SQLIntegrityConstraintViolationException exception =
+                    (SQLIntegrityConstraintViolationException) cause;
+            return exception.getErrorCode() == 1062
+                    && "23000".equals(exception.getSQLState())
+                    && exception.getMessage() != null
+                    && exception.getMessage().contains("PRIMARY");
+        }
+        return false;
     }
 
     private void collectVmMatchTargetUuid(Map<String, ResourceHypervisorInfo> uuidInfoMap) {
@@ -216,6 +277,19 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
         return vo;
     }
 
+    private static class VmLibvirtReportCallback extends EventCallback<Object> {
+        private final KvmHypervisorInfoManagerImpl owner;
+
+        VmLibvirtReportCallback(KvmHypervisorInfoManagerImpl owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        protected void run(Map<String, String> tokens, Object data) {
+            owner.onVmStart(data.toString());
+        }
+    }
+
     @Override
     public void clean(String uuid) {
         SQL.New(KvmHypervisorInfoVO.class).eq(KvmHypervisorInfoVO_.uuid, uuid).delete();
@@ -231,18 +305,8 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
     }
 
     private void registerRefreshVmHypervisorHooks() {
-        events.on(VmCanonicalEvents.VM_LIBVIRT_REPORT_REBOOT, new EventCallback<Object>() {
-            @Override
-            protected void run(Map<String, String> tokens, Object data) {
-                onVmStart(data.toString());
-            }
-        });
-        events.on(VmCanonicalEvents.VM_LIBVIRT_REPORT_START, new EventCallback<Object>() {
-            @Override
-            protected void run(Map<String, String> tokens, Object data) {
-                onVmStart(data.toString());
-            }
-        });
+        events.on(VmCanonicalEvents.VM_LIBVIRT_REPORT_REBOOT, new VmLibvirtReportCallback(this));
+        events.on(VmCanonicalEvents.VM_LIBVIRT_REPORT_START, new VmLibvirtReportCallback(this));
     }
 
     private void onVmStart(String vmUuid) {
@@ -273,8 +337,16 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
         return saveHostOsCategoryList(categoryVOS);
     }
 
-    @Transactional
     protected boolean saveHostOsCategoryList(List<HostOsCategoryVO> categoryVOS) {
+        return new SQLBatchWithReturn<Boolean>() {
+            @Override
+            protected Boolean scripts() {
+                return saveHostOsCategoryListUnderTransaction(categoryVOS);
+            }
+        }.execute();
+    }
+
+    private Boolean saveHostOsCategoryListUnderTransaction(List<HostOsCategoryVO> categoryVOS) {
         // refresh all metadata with current management node
         SQL.New(KvmHostHypervisorMetadataVO.class)
                 .eq(KvmHostHypervisorMetadataVO_.managementNodeUuid, Platform.getManagementServerId())
