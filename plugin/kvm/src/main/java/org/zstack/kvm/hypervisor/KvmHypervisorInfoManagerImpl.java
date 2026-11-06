@@ -57,8 +57,22 @@ public class KvmHypervisorInfoManagerImpl implements KvmHypervisorInfoManager, C
     @Override
     public void save(GetVirtualizerInfoRsp rsp) {
         final String hostUuid = rsp.getHostInfo().getUuid();
+        final String hostVersion = rsp.getHostInfo().getVersion();
         final List<ResourceHypervisorInfo> list = rsp.getVmInfoList().stream()
                 .map(info -> ResourceHypervisorInfo.fromVmVirtualizerInfo(info, hostUuid))
+                .peek(info -> {
+                    // fallback: when the agent fails to report the running qemu version
+                    // (e.g. get_install_date() returns None on some distros so
+                    // get_running_version() raises TypeError), the vmInfo.version is left
+                    // empty/null. KvmHypervisorInfoVO.version is NOT NULL, so persisting it
+                    // would fail with 1048 and roll back the whole save() transaction
+                    // (including the host row update), which makes hosts flap on reconnect.
+                    // A VM always runs on the host's qemu binary, so using the host version
+                    // is the semantically correct fallback.
+                    if (info.version == null || info.version.trim().isEmpty()) {
+                        info.version = hostVersion;
+                    }
+                })
                 .collect(Collectors.toList());
         list.add(ResourceHypervisorInfo.fromHostVirtualizerInfo(rsp.getHostInfo()));
         save(list);
